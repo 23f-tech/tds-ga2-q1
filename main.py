@@ -76,12 +76,10 @@ async def add_required_headers_and_logs(request: Request, call_next):
 
     origin = request.headers.get("origin")
 
-    # Strict CORS for Q1 /stats
     if origin == ALLOWED_ORIGIN:
         response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
         response.headers["Vary"] = "Origin"
 
-    # Open CORS for browser-checked endpoints
     if (
         request.url.path.startswith("/effective-config")
         or request.url.path.startswith("/analytics")
@@ -96,6 +94,7 @@ async def add_required_headers_and_logs(request: Request, call_next):
         response.headers["Access-Control-Allow-Headers"] = (
             "Content-Type, X-API-Key, X-Client-Id, Idempotency-Key"
         )
+        response.headers["Access-Control-Expose-Headers"] = "Retry-After"
         response.headers["Vary"] = "Origin"
 
     LOGS.append({
@@ -408,6 +407,18 @@ def check_rate_limit(client_id: str):
     return None
 
 
+def rate_limit_response(retry_after: int):
+    return JSONResponse(
+        status_code=429,
+        content={"error": "rate limit exceeded"},
+        headers={
+            "Retry-After": str(retry_after),
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "Retry-After",
+        },
+    )
+
+
 @app.options("/orders")
 async def options_orders():
     return Response(
@@ -416,6 +427,7 @@ async def options_orders():
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, X-Client-Id, Idempotency-Key",
+            "Access-Control-Expose-Headers": "Retry-After",
         },
     )
 
@@ -428,11 +440,7 @@ async def create_order(
 ):
     retry_after = check_rate_limit(x_client_id or "anonymous")
     if retry_after is not None:
-        return JSONResponse(
-            status_code=429,
-            content={"error": "rate limit exceeded"},
-            headers={"Retry-After": str(retry_after)},
-        )
+        return rate_limit_response(retry_after)
 
     if not idempotency_key:
         raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
@@ -471,11 +479,7 @@ async def list_orders(
 ):
     retry_after = check_rate_limit(x_client_id or "anonymous")
     if retry_after is not None:
-        return JSONResponse(
-            status_code=429,
-            content={"error": "rate limit exceeded"},
-            headers={"Retry-After": str(retry_after)},
-        )
+        return rate_limit_response(retry_after)
 
     if limit < 1:
         limit = 1
