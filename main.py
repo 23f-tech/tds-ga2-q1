@@ -65,7 +65,11 @@ async def add_required_headers_and_logs(request: Request, call_next):
     global REQUEST_COUNT
 
     start = time.perf_counter()
-    request_id = str(uuid.uuid4())
+
+    # Q10 request context middleware
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
+
     REQUEST_COUNT += 1
 
     response = await call_next(request)
@@ -76,10 +80,12 @@ async def add_required_headers_and_logs(request: Request, call_next):
 
     origin = request.headers.get("origin")
 
+    # Strict CORS for Q1 /stats
     if origin == ALLOWED_ORIGIN:
         response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
         response.headers["Vary"] = "Origin"
 
+    # Open CORS for browser-checked endpoints except /ping
     if (
         request.url.path.startswith("/effective-config")
         or request.url.path.startswith("/analytics")
@@ -92,10 +98,27 @@ async def add_required_headers_and_logs(request: Request, call_next):
         response.headers["Access-Control-Allow-Origin"] = "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = (
-            "Content-Type, X-API-Key, X-Client-Id, Idempotency-Key"
+            "Content-Type, X-API-Key, X-Client-Id, Idempotency-Key, X-Request-ID"
         )
-        response.headers["Access-Control-Expose-Headers"] = "Retry-After"
+        response.headers["Access-Control-Expose-Headers"] = "Retry-After, X-Request-ID"
         response.headers["Vary"] = "Origin"
+
+    # Q10 scoped CORS for /ping only: no wildcard
+    if request.url.path.startswith("/ping"):
+        ping_allowed_origins = {
+            "https://app-lirvlb.example.com",
+            "https://exam.sanand.workers.dev",
+            "https://tds.s-anand.net",
+        }
+
+        if origin in ping_allowed_origins:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = (
+                "Content-Type, X-Client-Id, X-Request-ID"
+            )
+            response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
+            response.headers["Vary"] = "Origin"
 
     LOGS.append({
         "level": "info",
@@ -513,4 +536,54 @@ async def list_orders(
     return {
         "items": items,
         "next_cursor": next_cursor,
+    }
+
+
+# ---------------- Q10: Middleware Stack API ----------------
+
+PING_RATE_LIMIT = 12
+PING_RATE_WINDOW_SECONDS = 10
+PING_RATE_BUCKETS = {}
+
+
+def check_ping_rate_limit(client_id: str):
+    now = time.time()
+
+    if not client_id:
+        client_id = "anonymous"
+
+    bucket = PING_RATE_BUCKETS.get(client_id, [])
+    bucket = [ts for ts in bucket if now - ts < PING_RATE_WINDOW_SECONDS]
+
+    if len(bucket) >= PING_RATE_LIMIT:
+        PING_RATE_BUCKETS[client_id] = bucket
+        return True
+
+    bucket.append(now)
+    PING_RATE_BUCKETS[client_id] = bucket
+    return False
+
+
+@app.options("/ping")
+async def options_ping():
+    return Response(status_code=204)
+
+
+@app.get("/ping")
+async def ping(
+    request: Request,
+    x_client_id: Optional[str] = Header(default="anonymous", alias="X-Client-Id"),
+):
+    if check_ping_rate_limit(x_client_id or "anonymous"):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate limit exceeded"},
+            headers={
+                "X-Request-ID": request.state.request_id,
+            },
+        )
+
+    return {
+        "email": EMAIL,
+        "request_id": request.state.request_id,
     }
