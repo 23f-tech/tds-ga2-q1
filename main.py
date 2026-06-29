@@ -1,6 +1,8 @@
 import os
 import time
 import uuid
+import base64
+import math
 from typing import List, Optional
 from collections import deque
 from datetime import datetime, timezone
@@ -87,10 +89,13 @@ async def add_required_headers_and_logs(request: Request, call_next):
         or request.url.path.startswith("/metrics")
         or request.url.path.startswith("/logs")
         or request.url.path.startswith("/healthz")
+        or request.url.path.startswith("/orders")
     ):
         response.headers["Access-Control-Allow-Origin"] = "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, X-API-Key, X-Client-Id, Idempotency-Key"
+        )
         response.headers["Vary"] = "Origin"
 
     LOGS.append({
@@ -356,3 +361,152 @@ async def logs_tail(limit: int = Query(10)):
     if limit < 0:
         limit = 0
     return list(LOGS)[-limit:]
+
+
+# ---------------- Q9: Orders API ----------------
+
+TOTAL_ORDERS = 58
+RATE_LIMIT = 17
+RATE_WINDOW_SECONDS = 10
+
+IDEMPOTENCY_STORE = {}
+NEXT_ORDER_ID = 1001
+RATE_BUCKETS = {}
+
+
+def encode_cursor(start_id: int) -> str:
+    raw = str(start_id).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+
+def decode_cursor(cursor: str) -> int:
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode((cursor + padding).encode("utf-8"))
+        return int(raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid cursor")
+
+
+def check_rate_limit(client_id: str):
+    now = time.time()
+
+    if not client_id:
+        client_id = "anonymous"
+
+    bucket = RATE_BUCKETS.get(client_id, [])
+
+    bucket = [ts for ts in bucket if now - ts < RATE_WINDOW_SECONDS]
+
+    if len(bucket) >= RATE_LIMIT:
+        retry_after = max(1, math.ceil(RATE_WINDOW_SECONDS - (now - bucket[0])))
+        RATE_BUCKETS[client_id] = bucket
+        return retry_after
+
+    bucket.append(now)
+    RATE_BUCKETS[client_id] = bucket
+    return None
+
+
+@app.options("/orders")
+async def options_orders():
+    return Response(
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, X-Client-Id, Idempotency-Key",
+        },
+    )
+
+
+@app.post("/orders")
+async def create_order(
+    request: Request,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    x_client_id: Optional[str] = Header(default="anonymous", alias="X-Client-Id"),
+):
+    retry_after = check_rate_limit(x_client_id or "anonymous")
+    if retry_after is not None:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate limit exceeded"},
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
+
+    if idempotency_key in IDEMPOTENCY_STORE:
+        return JSONResponse(
+            status_code=200,
+            content=IDEMPOTENCY_STORE[idempotency_key],
+        )
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    global NEXT_ORDER_ID
+
+    order = {
+        "id": f"ord_{NEXT_ORDER_ID}",
+        "email": EMAIL,
+        "status": "created",
+        "payload": payload,
+    }
+
+    NEXT_ORDER_ID += 1
+    IDEMPOTENCY_STORE[idempotency_key] = order
+
+    return JSONResponse(status_code=201, content=order)
+
+
+@app.get("/orders")
+async def list_orders(
+    limit: int = Query(10),
+    cursor: Optional[str] = Query(default=None),
+    x_client_id: Optional[str] = Header(default="anonymous", alias="X-Client-Id"),
+):
+    retry_after = check_rate_limit(x_client_id or "anonymous")
+    if retry_after is not None:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate limit exceeded"},
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    if limit < 1:
+        limit = 1
+
+    limit = min(limit, 100)
+
+    if cursor:
+        start_id = decode_cursor(cursor)
+    else:
+        start_id = 1
+
+    if start_id < 1:
+        start_id = 1
+
+    end_id = min(start_id + limit, TOTAL_ORDERS + 1)
+
+    items = [
+        {
+            "id": order_id,
+            "item": f"order-{order_id}",
+            "amount": float(order_id * 10),
+        }
+        for order_id in range(start_id, end_id)
+    ]
+
+    if end_id <= TOTAL_ORDERS:
+        next_cursor = encode_cursor(end_id)
+    else:
+        next_cursor = None
+
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+    }
