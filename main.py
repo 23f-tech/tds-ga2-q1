@@ -2,20 +2,30 @@ import os
 import time
 import uuid
 from typing import List, Optional
+from collections import deque
+from datetime import datetime, timezone
 
 import jwt
 from fastapi import FastAPI, Request, Query, HTTPException, Header
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, PlainTextResponse
 from pydantic import BaseModel
 
 app = FastAPI()
 
 EMAIL = "23f2002594@ds.study.iitm.ac.in"
 
-# Q1
+# ---------------- Common observability state for Q6 ----------------
+
+START_TIME = time.perf_counter()
+REQUEST_COUNT = 0
+LOGS = deque(maxlen=1000)
+
+# ---------------- Q1 ----------------
+
 ALLOWED_ORIGIN = "https://dash-251w5p.example.com"
 
-# Q2
+# ---------------- Q2 ----------------
+
 ISSUER = "https://idp.exam.local"
 AUDIENCE = "tds-y5cqp3p3.apps.exam.local"
 
@@ -29,7 +39,8 @@ SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
 dQIDAQAB
 -----END PUBLIC KEY-----"""
 
-# Q5
+# ---------------- Q5 ----------------
+
 API_KEY = "ak_e1elbl3a1vexap7iushfzygb"
 
 
@@ -48,9 +59,12 @@ class AnalyticsRequest(BaseModel):
 
 
 @app.middleware("http")
-async def add_required_headers(request: Request, call_next):
+async def add_required_headers_and_logs(request: Request, call_next):
+    global REQUEST_COUNT
+
     start = time.perf_counter()
     request_id = str(uuid.uuid4())
+    REQUEST_COUNT += 1
 
     response = await call_next(request)
 
@@ -60,15 +74,34 @@ async def add_required_headers(request: Request, call_next):
 
     origin = request.headers.get("origin")
 
+    # Strict CORS for Q1 /stats
     if origin == ALLOWED_ORIGIN:
         response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
         response.headers["Vary"] = "Origin"
 
-    if request.url.path.startswith("/effective-config") or request.url.path.startswith("/analytics"):
+    # Open CORS for browser-checked endpoints
+    if (
+        request.url.path.startswith("/effective-config")
+        or request.url.path.startswith("/analytics")
+        or request.url.path.startswith("/work")
+        or request.url.path.startswith("/metrics")
+        or request.url.path.startswith("/logs")
+        or request.url.path.startswith("/healthz")
+    ):
         response.headers["Access-Control-Allow-Origin"] = "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
         response.headers["Vary"] = "Origin"
+
+    LOGS.append({
+        "level": "info",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "path": request.url.path,
+        "request_id": request_id,
+        "method": request.method,
+        "status_code": response.status_code,
+        "process_time_s": process_time,
+    })
 
     return response
 
@@ -77,6 +110,8 @@ async def add_required_headers(request: Request, call_next):
 async def root():
     return {"message": "API is running"}
 
+
+# ---------------- Q1: Stats API ----------------
 
 @app.options("/stats")
 async def options_stats(request: Request):
@@ -118,6 +153,8 @@ async def stats(values: str = Query(...)):
     }
 
 
+# ---------------- Q2: JWT Verify API ----------------
+
 @app.post("/verify")
 async def verify_token(payload: VerifyRequest):
     try:
@@ -139,6 +176,8 @@ async def verify_token(payload: VerifyRequest):
     except Exception:
         return JSONResponse(status_code=401, content={"valid": False})
 
+
+# ---------------- Q3: Effective Config API ----------------
 
 def to_bool(value):
     if isinstance(value, bool):
@@ -219,6 +258,8 @@ async def effective_config(set_: List[str] = Query(default=[], alias="set")):
     return coerce_config(config)
 
 
+# ---------------- Q5: Analytics API ----------------
+
 @app.options("/analytics")
 async def options_analytics():
     return Response(
@@ -261,3 +302,57 @@ async def analytics(
         "revenue": revenue,
         "top_user": top_user,
     }
+
+
+# ---------------- Q6: Observability API ----------------
+
+@app.options("/work")
+async def options_work():
+    return Response(
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        },
+    )
+
+
+@app.get("/work")
+async def work(n: int = Query(1)):
+    if n < 0:
+        raise HTTPException(status_code=400, detail="n must be non-negative")
+
+    for _ in range(n):
+        pass
+
+    return {
+        "email": EMAIL,
+        "done": n,
+    }
+
+
+@app.get("/metrics")
+async def metrics():
+    body = (
+        "# HELP http_requests_total Total number of HTTP requests\n"
+        "# TYPE http_requests_total counter\n"
+        f"http_requests_total {REQUEST_COUNT}\n"
+    )
+    return PlainTextResponse(body, media_type="text/plain")
+
+
+@app.get("/healthz")
+async def healthz():
+    uptime = time.perf_counter() - START_TIME
+    return {
+        "status": "ok",
+        "uptime_s": uptime,
+    }
+
+
+@app.get("/logs/tail")
+async def logs_tail(limit: int = Query(10)):
+    if limit < 0:
+        limit = 0
+    return list(LOGS)[-limit:]
