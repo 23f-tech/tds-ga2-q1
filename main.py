@@ -1,12 +1,32 @@
 import time
 import uuid
+import jwt
+
 from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 
 app = FastAPI()
 
 ALLOWED_ORIGIN = "https://dash-251w5p.example.com"
 EMAIL = "23f2002594@ds.study.iitm.ac.in"
+
+ISSUER = "https://idp.exam.local"
+AUDIENCE = "tds-y5cqp3p3.apps.exam.local"
+
+PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2okOHspNjgA+2rTLbeuY
+cxiP/hG8C6Sb9iwg3yiLAA4HCnpITcbWCSelbvbYGuc3EbNy4xFyf5Cbj5DHJMID
+EkryOgyd2giIIIBOUBj8S63uGcnRpOBh9NFatfNwheKuzsPuVNldu6A9cNteNpXc
+WyJjG2axVfmq7i6SuKr1JoWYG7xTTAvKPujSl4OtsQfO3h5NepzdfXpr28oNnzfW
+ed+zclR6BcmNNo/WVfJ4xyCLSf0BCOgdTgW6PdaChd1l9VDetJZVEgC5tkyvXsfI
+SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
+dQIDAQAB
+-----END PUBLIC KEY-----"""
+
+
+class VerifyRequest(BaseModel):
+    token: str
 
 
 @app.middleware("http")
@@ -48,7 +68,7 @@ async def options_stats(request: Request):
 
 @app.get("/")
 async def root():
-    return {"message": "Stats API is running"}
+    return {"message": "API is running"}
 
 
 @app.get("/stats")
@@ -71,3 +91,25 @@ async def stats(values: str = Query(...)):
         "max": max(nums),
         "mean": total / len(nums),
     }
+
+
+@app.post("/verify")
+async def verify_token(payload: VerifyRequest):
+    try:
+        claims = jwt.decode(
+            payload.token,
+            PUBLIC_KEY,
+            algorithms=["RS256"],
+            issuer=ISSUER,
+            audience=AUDIENCE,
+        )
+
+        return {
+            "valid": True,
+            "email": claims.get("email"),
+            "sub": claims.get("sub"),
+            "aud": claims.get("aud"),
+        }
+
+    except Exception:
+        return JSONResponse(status_code=401, content={"valid": False})
