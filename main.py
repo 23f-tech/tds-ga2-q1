@@ -54,6 +54,7 @@ if request.url.path.startswith("/effective-config"):
     response.headers["Vary"] = "Origin"
 
 return response
+```
 
 @app.options("/stats")
 async def options_stats(request: Request):
@@ -202,3 +203,4 @@ for item in set_:
         apply_layer(config, {key: value})
 
 return coerce_config(config)
+```
