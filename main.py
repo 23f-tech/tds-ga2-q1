@@ -1,20 +1,21 @@
 import os
 import time
 import uuid
-from typing import List
+from typing import List, Optional
 
 import jwt
-from fastapi import FastAPI, Request, Query, HTTPException
+from fastapi import FastAPI, Request, Query, HTTPException, Header
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 app = FastAPI()
 
-# Q1 values
-ALLOWED_ORIGIN = "https://dash-251w5p.example.com"
 EMAIL = "23f2002594@ds.study.iitm.ac.in"
 
-# Q2 values
+# Q1
+ALLOWED_ORIGIN = "https://dash-251w5p.example.com"
+
+# Q2
 ISSUER = "https://idp.exam.local"
 AUDIENCE = "tds-y5cqp3p3.apps.exam.local"
 
@@ -28,9 +29,22 @@ SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
 dQIDAQAB
 -----END PUBLIC KEY-----"""
 
+# Q5
+API_KEY = "ak_e1elbl3a1vexap7iushfzygb"
+
 
 class VerifyRequest(BaseModel):
     token: str
+
+
+class Event(BaseModel):
+    user: str
+    amount: float
+    ts: int
+
+
+class AnalyticsRequest(BaseModel):
+    events: List[Event]
 
 
 @app.middleware("http")
@@ -46,16 +60,14 @@ async def add_required_headers(request: Request, call_next):
 
     origin = request.headers.get("origin")
 
-    # Strict CORS for Q1 /stats
     if origin == ALLOWED_ORIGIN:
         response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
         response.headers["Vary"] = "Origin"
 
-    # Open CORS for Q3 /effective-config so browser grader can check it
-    if request.url.path.startswith("/effective-config"):
-        response.headers["Access-Control-Allow-Origin"] = origin or "*"
-        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "*"
+    if request.url.path.startswith("/effective-config") or request.url.path.startswith("/analytics"):
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
         response.headers["Vary"] = "Origin"
 
     return response
@@ -65,8 +77,6 @@ async def add_required_headers(request: Request, call_next):
 async def root():
     return {"message": "API is running"}
 
-
-# ---------------- Q1: Stats API ----------------
 
 @app.options("/stats")
 async def options_stats(request: Request):
@@ -108,8 +118,6 @@ async def stats(values: str = Query(...)):
     }
 
 
-# ---------------- Q2: JWT Verify API ----------------
-
 @app.post("/verify")
 async def verify_token(payload: VerifyRequest):
     try:
@@ -131,8 +139,6 @@ async def verify_token(payload: VerifyRequest):
     except Exception:
         return JSONResponse(status_code=401, content={"valid": False})
 
-
-# ---------------- Q3: Effective Config API ----------------
 
 def to_bool(value):
     if isinstance(value, bool):
@@ -164,15 +170,13 @@ def coerce_config(config):
 
 
 @app.options("/effective-config")
-async def options_effective_config(request: Request):
-    origin = request.headers.get("origin")
+async def options_effective_config():
     return Response(
         status_code=204,
         headers={
-            "Access-Control-Allow-Origin": origin or "*",
+            "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-            "Vary": "Origin",
+            "Access-Control-Allow-Headers": "Content-Type",
         },
     )
 
@@ -181,7 +185,6 @@ async def options_effective_config(request: Request):
 async def effective_config(set_: List[str] = Query(default=[], alias="set")):
     config = {}
 
-    # 1. defaults
     apply_layer(config, {
         "port": 8000,
         "workers": 1,
@@ -190,33 +193,71 @@ async def effective_config(set_: List[str] = Query(default=[], alias="set")):
         "api_key": "default-secret-000",
     })
 
-    # 2. config.development.yaml
     apply_layer(config, {
         "workers": 12,
     })
 
-    # 3. .env file
     apply_layer(config, {
         "APP_API_KEY": "key-hfb5qw6oek",
     })
 
-    # 4. OS environment variables
     apply_layer(config, {
         "APP_PORT": os.getenv("APP_PORT", "8097"),
         "APP_DEBUG": os.getenv("APP_DEBUG", "true"),
         "APP_API_KEY": os.getenv("APP_API_KEY", "key-jx8gfv8sqg"),
     })
 
-    # Also support real APP_* variables if set in Render
     for key, value in os.environ.items():
         if key.startswith("APP_") or key == "NUM_WORKERS":
             apply_layer(config, {key: value})
 
-    # 5. CLI-style overrides from query params
-    # Example: ?set=port=9000&set=debug=false
     for item in set_:
         if "=" in item:
             key, value = item.split("=", 1)
             apply_layer(config, {key: value})
 
     return coerce_config(config)
+
+
+@app.options("/analytics")
+async def options_analytics():
+    return Response(
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, X-API-Key",
+        },
+    )
+
+
+@app.post("/analytics")
+async def analytics(
+    payload: AnalyticsRequest,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")
+):
+    if x_api_key != API_KEY:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+
+    events = payload.events
+
+    total_events = len(events)
+    unique_users = len(set(event.user for event in events))
+
+    revenue = 0.0
+    user_totals = {}
+
+    for event in events:
+        if event.amount > 0:
+            revenue += event.amount
+            user_totals[event.user] = user_totals.get(event.user, 0.0) + event.amount
+
+    top_user = max(user_totals, key=user_totals.get) if user_totals else ""
+
+    return {
+        "email": EMAIL,
+        "total_events": total_events,
+        "unique_users": unique_users,
+        "revenue": revenue,
+        "top_user": top_user,
+    }
